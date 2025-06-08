@@ -10,6 +10,10 @@ import gradio as gr
 import time
 import uuid
 import gc
+import requests
+import argparse
+import base64
+from io import BytesIO
 
 # 导入原有代码中的所有函数
 from ram.models.ram_lora import ram
@@ -32,18 +36,67 @@ def resize_and_center_crop(img: Image.Image, size: int) -> Image.Image:
     top  = (new_h - size) // 2
     return img.crop((left, top, left + size, top + size))
 
+def call_litellm_api(messages, api_base, api_key, model="gpt-4"):  # 默认gpt-4，可自定义
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 128,
+        "temperature": 0.7
+    }
+    response = requests.post(f"{api_base}/v1/chat/completions", headers=headers, json=payload)
+    response.raise_for_status()
+    return response.json()['choices'][0]['message']['content']
+
+def image_to_base64(image):
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode()
+
 # 从原始代码中保留get_validation_prompt函数
-def get_validation_prompt(args, image, prompt_image_path, dape_model=None, vlm_model=None, device='cuda'):
-    # 准备低分辨率张量作为SR输入
+def get_validation_prompt(args, image, prompt_image_path, dape_model=None, vlm_model_in=None, device='cuda'):
+    global vlm_model, vlm_processor, process_vision_info
     lq = tensor_transforms(image).unsqueeze(0).to(device)
-    # 选择提示源
-    if args.prompt_type == "null":
-        prompt_text = args.prompt or ""
-    elif args.prompt_type == "dape":
-        lq_ram = ram_transforms(lq).to(dtype=weight_dtype)
-        captions = inference(lq_ram, dape_model)
-        prompt_text = f"{captions[0]}, {args.prompt}," if args.prompt else captions[0]
-    elif args.prompt_type in ("vlm"):
+    if getattr(args, 'prompt_backend', 'local') == 'litellm':
+        # 支持图片base64
+        if args.rec_type == "recursive_multiscale":
+            user_prompt = "The second image is a zoom-in of the first image. Based on this knowledge, what is in the second image? Give me a set of words."
+        else:
+            user_prompt = "What is in this image? Give me a set of words."
+        img_b64 = image_to_base64(image)
+        messages = [
+            {"role": "system", "content": user_prompt},
+            {"role": "user", "content": [
+                {"type": "text", "text": "请根据图像内容生成一组英文关键词。"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+            ]}
+        ]
+        prompt_text = call_litellm_api(
+            messages,
+            api_base=getattr(args, 'litellm_api_base', ''),
+            api_key=getattr(args, 'litellm_api_key', ''),
+            model=getattr(args, 'litellm_model', 'gpt-4')
+        )
+        if args.prompt:
+            prompt_text = f"{prompt_text}, {args.prompt}"
+        return prompt_text, lq
+    # 本地VLM分支，按需加载
+    if args.prompt_type in ("vlm") and getattr(args, 'prompt_backend', 'local') == 'local':
+        if vlm_model is None or vlm_processor is None or process_vision_info is None:
+            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+            from qwen_vl_utils import process_vision_info as pvi
+            vlm_model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+            print(f"[LazyLoad] Loading base VLM model: {vlm_model_name}")
+            vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                vlm_model_name,
+                torch_dtype="auto",
+                device_map="auto"
+            )
+            vlm_processor = AutoProcessor.from_pretrained(vlm_model_name)
+            process_vision_info = pvi
         message_text = None
         
         if args.rec_type == "recursive":
@@ -134,6 +187,12 @@ def get_validation_prompt(args, image, prompt_image_path, dape_model=None, vlm_m
             model.text_enc_3.to(original_sr_devices['text_enc_3'])
             model.transformer.to(original_sr_devices['transformer'])
             model.vae.to(original_sr_devices['vae'])
+    elif args.prompt_type == "null":
+        prompt_text = args.prompt or ""
+    elif args.prompt_type == "dape":
+        lq_ram = ram_transforms(lq).to(dtype=weight_dtype)
+        captions = inference(lq_ram, dape_model)
+        prompt_text = f"{captions[0]}, {args.prompt}," if args.prompt else captions[0]
     else:
         raise ValueError(f"Unknown prompt_type: {args.prompt_type}")
     return prompt_text, lq
@@ -250,18 +309,20 @@ class Args:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+        # 新增默认参数
+        self.prompt_backend = kwargs.get('prompt_backend', 'local')
+        self.litellm_api_base = kwargs.get('litellm_api_base', '')
+        self.litellm_api_key = kwargs.get('litellm_api_key', '')
+        self.litellm_model = kwargs.get('litellm_model', 'gpt-4')
 
 args_global = Args(**MODEL_CONFIG)
 global weight_dtype
 weight_dtype = torch.float16 if args_global.mixed_precision == "fp16" else torch.float32
 
-global model, model_test, DAPE, vlm_model, vlm_processor, process_vision_info
+global model, model_test, DAPE
 model = None
 model_test = None
 DAPE = None
-vlm_model = None
-vlm_processor = None
-process_vision_info = None
 
 # 加载SR模型
 if args_global.rec_type not in ('nearest', 'bicubic'):
@@ -294,19 +355,6 @@ if args_global.prompt_type == "dape":
     DAPE.eval().to("cuda")
     DAPE = DAPE.to(dtype=weight_dtype)
 
-# 加载VLM模型（如需要）
-if args_global.prompt_type == "vlm":
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-    from qwen_vl_utils import process_vision_info
-    vlm_model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
-    print(f"Loading base VLM model: {vlm_model_name}")
-    vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        vlm_model_name,
-        torch_dtype="auto",
-        device_map="auto"
-    )
-    vlm_processor = AutoProcessor.from_pretrained(vlm_model_name)
-
 # 主处理函数，将被UI调用
 def process_image(
     input_image,
@@ -319,9 +367,13 @@ def process_image(
     user_prompt="",
     efficient_memory=True,
     mixed_precision="fp16",
-    concat_layout="horizontal"
+    concat_layout="horizontal",
+    prompt_backend="local",
+    litellm_api_base="",
+    litellm_api_key="",
+    litellm_model="gpt-4"
 ):
-    global model, model_test, DAPE, vlm_model, vlm_processor, process_vision_info
+    global model, model_test, DAPE
     # 创建临时目录存储结果
     temp_dir = "temp_results"
     os.makedirs(temp_dir, exist_ok=True)
@@ -363,6 +415,11 @@ def process_image(
             self.latent_tiled_size = 96
             self.latent_tiled_overlap = 32
             self.seed = 42
+            # 新增
+            self.prompt_backend = prompt_backend
+            self.litellm_api_base = litellm_api_base
+            self.litellm_api_key = litellm_api_key
+            self.litellm_model = litellm_model
     
     args = Args()
     
@@ -449,7 +506,7 @@ def process_image(
             prompt_image_path = [prev_sr_output_path, zoomed_image_path]
             
         # 生成提示词
-        validation_prompt, lq = get_validation_prompt(args, current_sr_input_image_pil, prompt_image_path, DAPE, vlm_model)
+        validation_prompt, lq = get_validation_prompt(args, current_sr_input_image_pil, prompt_image_path, DAPE)
         print(f'TAG: {validation_prompt}')
         
         # 保存本次使用的提示词
@@ -588,6 +645,18 @@ def create_ui():
                         info="选择最终拼接图的布局方式"
                     )
                 
+                with gr.Group():
+                    gr.Markdown("### 提示词后端设置")
+                    prompt_backend = gr.Radio(
+                        label="提示词生成后端", 
+                        choices=["local", "litellm"], 
+                        value="local",
+                        info="选择本地VLM或远程LiteLLM API"
+                    )
+                    litellm_api_base = gr.Textbox(label="LiteLLM API Base", placeholder="如 https://your-litellm-server.com")
+                    litellm_api_key = gr.Textbox(label="LiteLLM API Key", type="password")
+                    litellm_model = gr.Textbox(label="LiteLLM模型名", value="gpt-4")
+                
                 process_btn = gr.Button("开始处理", variant="primary")
             
             with gr.Column(scale=2):
@@ -630,7 +699,7 @@ def create_ui():
             inputs=[
                 input_image, process_size, upscale, rec_type, rec_num,
                 prompt_type, align_method, user_prompt, efficient_memory, mixed_precision,
-                concat_layout
+                concat_layout, prompt_backend, litellm_api_base, litellm_api_key, litellm_model
             ],
             outputs=[
                 output_gallery, final_output, prompts_list, size_info, output_path, zoom_regions_gallery
@@ -690,5 +759,117 @@ def create_ui():
 
 # 启动服务
 if __name__ == "__main__":
-    ui = create_ui()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--prompt-backend', type=str, default='local', choices=['local', 'litellm'], help='提示词生成后端')
+    parser.add_argument('--litellm-api-base', type=str, default='', help='LiteLLM API Base')
+    parser.add_argument('--litellm-api-key', type=str, default='', help='LiteLLM API Key')
+    parser.add_argument('--litellm-model', type=str, default='sonnet-3.7', help='LiteLLM模型名')
+    args_cli = parser.parse_args()
+
+    def create_ui_with_args():
+        with gr.Blocks(title="Chain-of-Zoom 图像超分辨率工具", theme=gr.themes.Soft()) as demo:
+            gr.Markdown("# 🔍 Chain-of-Zoom 图像超分辨率工具")
+            gr.Markdown("使用AI技术逐步放大图像细节，实现高质量的图像超分辨率")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    input_image = gr.Image(label="输入图像", type="pil")
+                    with gr.Group():
+                        gr.Markdown("### 基本参数")
+                        with gr.Row():
+                            process_size = gr.Slider(label="处理尺寸", minimum=256, maximum=1024, value=512, step=64)
+                            upscale = gr.Slider(label="每次放大倍数", minimum=2, maximum=8, value=4, step=1)
+                        with gr.Row():
+                            rec_type = gr.Dropdown(
+                                label="递归类型", 
+                                choices=["recursive_multiscale", "recursive", "onestep", "nearest", "bicubic"], 
+                                value="recursive_multiscale",
+                                info="multiscale模式可获得最佳质量"
+                            )
+                            rec_num = gr.Slider(label="递归次数", minimum=1, maximum=6, value=4, step=1)
+                    with gr.Group():
+                        gr.Markdown("### 高级参数")
+                        with gr.Row():
+                            prompt_type = gr.Dropdown(
+                                label="提示词类型", 
+                                choices=["vlm", "dape", "null"], 
+                                value="vlm",
+                                info="VLM使用视觉语言模型生成提示词"
+                            )
+                            align_method = gr.Dropdown(
+                                label="颜色对齐方法", 
+                                choices=["nofix", "wavelet", "adain"], 
+                                value="nofix",
+                                info="颜色修正算法"
+                            )
+                        user_prompt = gr.Textbox(
+                            label="自定义提示词（可选）", 
+                            placeholder="输入额外的提示词，用于引导图像生成",
+                            info="额外的提示词将与自动生成的提示词合并"
+                        )
+                        with gr.Row():
+                            efficient_memory = gr.Checkbox(label="高效内存模式", value=True, info="优化GPU内存使用")
+                            mixed_precision = gr.Dropdown(label="精度", choices=["fp16", "fp32"], value="fp16", info="fp16速度更快，fp32质量更好")
+                    with gr.Group():
+                        gr.Markdown("### 输出选项")
+                        concat_layout = gr.Radio(
+                            label="拼接布局", 
+                            choices=["horizontal", "vertical", "grid"], 
+                            value="horizontal",
+                            info="选择最终拼接图的布局方式"
+                        )
+                    with gr.Group():
+                        gr.Markdown("### 提示词后端设置")
+                        prompt_backend = gr.Radio(
+                            label="提示词生成后端", 
+                            choices=["local", "litellm"], 
+                            value=args_cli.prompt_backend,
+                            info="选择本地VLM或远程LiteLLM API"
+                        )
+                        litellm_api_base = gr.Textbox(label="LiteLLM API Base", value=args_cli.litellm_api_base, placeholder="如 https://your-litellm-server.com")
+                        litellm_api_key = gr.Textbox(label="LiteLLM API Key", value=args_cli.litellm_api_key, type="password")
+                        litellm_model = gr.Textbox(label="LiteLLM模型名", value=args_cli.litellm_model)
+                    process_btn = gr.Button("开始处理", variant="primary")
+                with gr.Column(scale=2):
+                    with gr.Tabs():
+                        with gr.TabItem("结果展示"):
+                            size_info = gr.Textbox(label="最终图像尺寸", interactive=False)
+                            final_output = gr.Image(label="最终拼接结果", type="pil", interactive=False)
+                            download_btn = gr.Button("下载完整拼接图", variant="secondary")
+                            output_path = gr.Textbox(visible=False)
+                            with gr.Accordion("所有步骤结果", open=False):
+                                with gr.Row():
+                                    output_gallery = gr.Gallery(
+                                        label="放大过程", 
+                                        show_label=True,
+                                        columns=5,
+                                        object_fit="contain",
+                                        height=300
+                                    )
+                                    prompts_list = gr.Dataframe(
+                                        headers=["步骤", "提示词"],
+                                        datatype=["str", "str"],
+                                        col_count=(2, "fixed"),
+                                        interactive=False
+                                    )
+                        with gr.TabItem("放大区域可视化"):
+                            zoom_regions_gallery = gr.Gallery(
+                                label="每步放大区域", 
+                                show_label=True,
+                                columns=3,
+                                object_fit="contain",
+                                height=500
+                            )
+                process_outputs = process_btn.click(
+                    fn=process_image,
+                    inputs=[
+                        input_image, process_size, upscale, rec_type, rec_num,
+                        prompt_type, align_method, user_prompt, efficient_memory, mixed_precision,
+                        concat_layout, prompt_backend, litellm_api_base, litellm_api_key, litellm_model
+                    ],
+                    outputs=[
+                        output_gallery, final_output, prompts_list, size_info, output_path, zoom_regions_gallery
+                    ]
+                )
+        return demo
+    ui = create_ui_with_args()
     ui.launch(share=False, server_name="0.0.0.0")
