@@ -73,6 +73,25 @@ python gradio_coz.py
 
 默认会在本地 `http://0.0.0.0:7860` 启动服务，可在浏览器访问。
 
+#### 支持远程LiteLLM大模型API的启动方式
+
+你也可以通过命令行参数，直接指定远程大模型API（如gpt-4、Claude等）作为提示词生成后端。例如：
+
+```bash
+python gradio_coz.py \
+  --prompt-backend litellm \
+  --litellm-api-base https://XXXXXXXXX \
+  --litellm-api-key sk-XXXXXXXXXXXXXXXXXXXXX \
+  --litellm-model bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0-25k
+```
+
+- `--prompt-backend litellm`：指定使用LiteLLM远程API作为提示词生成后端（默认local为本地VLM）
+- `--litellm-api-base`：你的LiteLLM服务API地址
+- `--litellm-api-key`：你的API密钥
+- `--litellm-model`：指定远程API使用的模型名（如gpt-4、sonnet、Claude等）
+
+这样启动后，Web UI界面会自动填充这些参数，所有提示词生成均通过远程大模型API完成，适合本地无大模型环境或需要更强大模型的场景。
+
 #### Web UI 使用说明
 
 1. 上传一张图像或使用示例图像
