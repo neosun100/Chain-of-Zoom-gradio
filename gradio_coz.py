@@ -9,6 +9,7 @@ from PIL import Image
 import gradio as gr
 import time
 import uuid
+import gc
 
 # 导入原有代码中的所有函数
 from ram.models.ram_lora import ram
@@ -215,6 +216,97 @@ def create_enhanced_concat(images, layout="horizontal", spacing=5, background_co
         
     return concat
 
+# ========== 全局模型加载 ==========
+# 只加载一次，后续推理直接复用
+
+# 配置参数（可根据需要调整）
+MODEL_CONFIG = {
+    'process_size': 512,
+    'upscale': 4,
+    'rec_type': 'recursive_multiscale',
+    'rec_num': 4,
+    'prompt_type': 'vlm',
+    'align_method': 'nofix',
+    'user_prompt': '',
+    'efficient_memory': True,
+    'mixed_precision': 'fp16',
+    'concat_layout': 'horizontal',
+    'lora_path': 'ckpt/SR_LoRA/model_20001.pkl',
+    'vae_path': 'ckpt/SR_VAE/vae_encoder_20001.pt',
+    'pretrained_model_name_or_path': 'stabilityai/stable-diffusion-3-medium-diffusers',
+    'ram_ft_path': 'ckpt/DAPE/DAPE.pth',
+    'ram_path': 'ckpt/RAM/ram_swin_large_14m.pth',
+    'save_prompts': True,
+    'merge_and_unload_lora': False,
+    'lora_rank': 4,
+    'vae_decoder_tiled_size': 224,
+    'vae_encoder_tiled_size': 1024,
+    'latent_tiled_size': 96,
+    'latent_tiled_overlap': 32,
+    'seed': 42
+}
+
+class Args:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+args_global = Args(**MODEL_CONFIG)
+global weight_dtype
+weight_dtype = torch.float16 if args_global.mixed_precision == "fp16" else torch.float32
+
+global model, model_test, DAPE, vlm_model, vlm_processor, process_vision_info
+model = None
+model_test = None
+DAPE = None
+vlm_model = None
+vlm_processor = None
+process_vision_info = None
+
+# 加载SR模型
+if args_global.rec_type not in ('nearest', 'bicubic'):
+    if not args_global.efficient_memory:
+        from osediff_sd3 import OSEDiff_SD3_TEST, SD3Euler
+        model = SD3Euler()
+        model.text_enc_1.to('cuda')
+        model.text_enc_2.to('cuda')
+        model.text_enc_3.to('cuda')
+        model.transformer.to('cuda', dtype=torch.float32)
+        model.vae.to('cuda', dtype=torch.float32)
+        for p in [model.text_enc_1, model.text_enc_2, model.text_enc_3, model.transformer, model.vae]:
+            p.requires_grad_(False)
+        model_test = OSEDiff_SD3_TEST(args_global, model)
+    else:
+        from osediff_sd3 import OSEDiff_SD3_TEST_efficient, SD3Euler
+        model = SD3Euler()
+        model.transformer.to('cuda', dtype=torch.float32)
+        model.vae.to('cuda', dtype=torch.float32)
+        for p in [model.text_enc_1, model.text_enc_2, model.text_enc_3, model.transformer, model.vae]:
+            p.requires_grad_(False)
+        model_test = OSEDiff_SD3_TEST_efficient(args_global, model)
+
+# 加载DAPE模型（如需要）
+if args_global.prompt_type == "dape":
+    DAPE = ram(pretrained=args_global.ram_path,
+              pretrained_condition=args_global.ram_ft_path,
+              image_size=384,
+              vit='swin_l')
+    DAPE.eval().to("cuda")
+    DAPE = DAPE.to(dtype=weight_dtype)
+
+# 加载VLM模型（如需要）
+if args_global.prompt_type == "vlm":
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+    from qwen_vl_utils import process_vision_info
+    vlm_model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
+    print(f"Loading base VLM model: {vlm_model_name}")
+    vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        vlm_model_name,
+        torch_dtype="auto",
+        device_map="auto"
+    )
+    vlm_processor = AutoProcessor.from_pretrained(vlm_model_name)
+
 # 主处理函数，将被UI调用
 def process_image(
     input_image,
@@ -229,6 +321,7 @@ def process_image(
     mixed_precision="fp16",
     concat_layout="horizontal"
 ):
+    global model, model_test, DAPE, vlm_model, vlm_processor, process_vision_info
     # 创建临时目录存储结果
     temp_dir = "temp_results"
     os.makedirs(temp_dir, exist_ok=True)
@@ -275,59 +368,6 @@ def process_image(
     
     global weight_dtype
     weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.float32
-    
-    # 初始化模型
-    global model
-    global model_test
-    global vlm_model
-    global vlm_processor
-    global process_vision_info
-    
-    # 加载模型代码（与原代码相同）
-    if rec_type not in ('nearest', 'bicubic'):
-        if not args.efficient_memory:
-            from osediff_sd3 import OSEDiff_SD3_TEST, SD3Euler
-            model = SD3Euler()
-            model.text_enc_1.to('cuda')
-            model.text_enc_2.to('cuda')
-            model.text_enc_3.to('cuda')
-            model.transformer.to('cuda', dtype=torch.float32)
-            model.vae.to('cuda', dtype=torch.float32)
-            for p in [model.text_enc_1, model.text_enc_2, model.text_enc_3, model.transformer, model.vae]:
-                p.requires_grad_(False)
-            model_test = OSEDiff_SD3_TEST(args, model)
-        else:
-            from osediff_sd3 import OSEDiff_SD3_TEST_efficient, SD3Euler
-            model = SD3Euler()
-            model.transformer.to('cuda', dtype=torch.float32)
-            model.vae.to('cuda', dtype=torch.float32)
-            for p in [model.text_enc_1, model.text_enc_2, model.text_enc_3, model.transformer, model.vae]:
-                p.requires_grad_(False)
-            model_test = OSEDiff_SD3_TEST_efficient(args, model)
-    
-    # 加载DAPE模型（如需要）
-    DAPE = None
-    if prompt_type == "dape":
-        DAPE = ram(pretrained=args.ram_path,
-                  pretrained_condition=args.ram_ft_path,
-                  image_size=384,
-                  vit='swin_l')
-        DAPE.eval().to("cuda")
-        DAPE = DAPE.to(dtype=weight_dtype)
-    
-    # 加载VLM模型（如需要）
-    if prompt_type == "vlm" and 'vlm_model' not in globals():
-        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-        from qwen_vl_utils import process_vision_info
-        
-        vlm_model_name = "Qwen/Qwen2.5-VL-3B-Instruct"
-        print(f"Loading base VLM model: {vlm_model_name}")
-        vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            vlm_model_name,
-            torch_dtype="auto",
-            device_map="auto"
-        )
-        vlm_processor = AutoProcessor.from_pretrained(vlm_model_name)
     
     # 处理图像
     bname = f"result_{result_id}.png"
@@ -482,6 +522,9 @@ def process_image(
     # 将提示词列表转换为Dataframe可接受的格式
     prompts_data = [[f"步骤 {i}", prompt] for i, prompt in enumerate(prompts)]
     
+    # 返回处理结果前，主动清理显存
+    gc.collect()
+    torch.cuda.empty_cache()
     # 返回处理结果
     return results, concat, prompts_data, size_info, concat_path, zoom_regions
 
